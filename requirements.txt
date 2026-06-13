@@ -1,0 +1,4 @@
+jmcomic>=2.6.0
+Pillow>=9.0.0
+img2pdf>=0.4.4
+PyPDF2>=3.0.0

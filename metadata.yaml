@@ -1,0 +1,7 @@
+name: astrbot_plugin_jmcomic
+display_name: JMComic 禁漫搜索
+description: |
+  从禁漫天堂搜索本子，支持查看详情和以聊天记录形式发送图片。
+  命令: /jm <关键词> | /jm看图 <序号或章节ID>
+version: 1.0.0
+author: tddji
