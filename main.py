@@ -1,7 +1,7 @@
 """
 JMComic 禁漫搜索 - AstrBot 插件
 /jm 关键词    → 分页搜索（8条/页），合并转发展示封面+名字
-回复数字       → 全局序号查看详情
+/jm <序号>    → 有缓存：全局序号看详情；无缓存：禁漫ID查详情
 /jm看图 N     → 全局第N本 → 下载第1话 → 生成PDF发送
 +/下一页      → 下一页
 -/上一页      → 上一页
@@ -13,6 +13,7 @@ import base64
 import uuid
 import tempfile
 import asyncio
+import time
 from concurrent.futures import ThreadPoolExecutor
 from astrbot.api.message_components import Image, Nodes, Plain, Node, File
 from astrbot.api import logger
@@ -35,12 +36,35 @@ except ImportError:
 PAGE_SIZE = 8
 MAX_PAGES = 3
 MAX_RESULTS = PAGE_SIZE * MAX_PAGES  # 24
+CACHE_TTL = 300  # 搜索缓存 5 分钟
+COVER_MAX_EDGE = 400  # 封面长边限制（减少 base64 体积，避免 retcode=1200）
 
 _thread_pool = ThreadPoolExecutor(max_workers=3)
 
 
-def _file_to_base64_image(filepath: str) -> str:
-    """读取图片文件并返回 base64 data URL"""
+def _file_to_base64_image(filepath: str, max_edge: int = 0, quality: int = 0) -> str:
+    """读取图片文件并返回 base64 data URL。可选压缩参数。"""
+    if max_edge > 0 and quality > 0:
+        try:
+            from PIL import Image as PILImage
+            img = PILImage.open(filepath)
+            if img.mode not in ("RGB", "RGBA"):
+                img = img.convert("RGB")
+            w, h = img.size
+            if max(w, h) > max_edge:
+                ratio = max_edge / max(w, h)
+                img = img.resize((int(w * ratio), int(h * ratio)), PILImage.LANCZOS)
+            img = img.convert("RGB")
+            import io
+            buf = io.BytesIO()
+            img.save(buf, "JPEG", quality=quality, optimize=True)
+            img.close()
+            data = base64.b64encode(buf.getvalue()).decode("ascii")
+            mime = "image/jpeg"
+            return f"base64://{data}"
+        except Exception:
+            pass
+
     with open(filepath, "rb") as f:
         data = base64.b64encode(f.read()).decode("ascii")
     ext = os.path.splitext(filepath)[1].lower()
@@ -54,7 +78,7 @@ def _file_to_base64_image(filepath: str) -> str:
     "astrbot_plugin_jmcomic",
     "JMComic禁漫搜索",
     "禁漫本子分页搜索/查看详情/看图PDF",
-    "2.1.0",
+    "2.2.0",
 )
 class JMComicPlugin(Star):
     def __init__(self, context: Context):
@@ -62,9 +86,12 @@ class JMComicPlugin(Star):
         self._load_config()
         self._client = None
         self._option = None
-        self._search_cache = {}   # user_id → {"results": [...], "page": 0, "total_pages": 1, "keyword": "少女"}
-        self._photo_cache = {}    # user_id → JmAlbumDetail
-        self._cover_cache = {}    # album_id → base64url
+        # user_id → {"results": [...], "page": 0, "total_pages": 1, "keyword": "少女", "expires_at": timestamp}
+        self._search_cache = {}
+        # user_id → JmAlbumDetail (上次查看详情选中的本子)
+        self._photo_cache = {}
+        # album_id → base64url 封面缓存
+        self._cover_cache = {}
         self.temp_dir = os.path.join(tempfile.gettempdir(), "astrbot_jmcomic")
         os.makedirs(self.temp_dir, exist_ok=True)
 
@@ -72,6 +99,17 @@ class JMComicPlugin(Star):
             logger.warning("jmcomic 库未安装，插件功能不可用。请执行 pip install jmcomic")
         else:
             self._init_jm_client()
+
+    # ============ 缓存过期辅助 ============
+    def _cache_valid(self, user_id: str) -> bool:
+        """检查搜索缓存是否存在且未过期"""
+        cache = self._search_cache.get(user_id)
+        if not cache:
+            return False
+        if time.time() > cache.get("expires_at", 0):
+            del self._search_cache[user_id]
+            return False
+        return True
 
     # ============ 配置加载 ============
     def _load_config(self):
@@ -128,11 +166,11 @@ class JMComicPlugin(Star):
     @filter.regex(r"^(\+|下一页|\-|上一页)$")
     async def page_nav(self, event):
         user_id = event.get_sender_id()
-        cache = self._search_cache.get(user_id)
-        if not cache:
+        if not self._cache_valid(user_id):
             return
         event.stop_event()
 
+        cache = self._search_cache[user_id]
         raw = event.message_str.strip()
         if raw in ("+", "下一页"):
             if cache["page"] >= cache["total_pages"] - 1:
@@ -146,23 +184,6 @@ class JMComicPlugin(Star):
             cache["page"] -= 1
 
         async for result in self._build_search_page(event, cache):
-            yield result
-
-    # ============ 数字选择（全局序号 → 详情）============
-    @filter.regex(r"^\d+$")
-    async def number_select(self, event):
-        user_id = event.get_sender_id()
-        cache = self._search_cache.get(user_id)
-        if not cache:
-            return
-        event.stop_event()
-
-        n = int(event.message_str.strip())
-        if n < 1 or n > len(cache["results"]):
-            yield event.plain_result(f"序号超出范围（共 {len(cache['results'])} 个结果）。")
-            return
-
-        async for result in self._jm_show_detail(event, cache["results"][n - 1]["album_id"]):
             yield result
 
     # ============ 工具方法 ============
@@ -198,24 +219,24 @@ class JMComicPlugin(Star):
             return False
 
     async def _get_cover_base64(self, album_id: str) -> str | None:
+        """获取封面 base64（压缩后，减少体积避免 retcode=1200）"""
         if album_id in self._cover_cache:
             return self._cover_cache[album_id]
 
         cover_path = os.path.join(self.temp_dir, f"cover_{album_id}.jpg")
         if os.path.exists(cover_path) and os.path.getsize(cover_path) > 0:
-            b64 = _file_to_base64_image(cover_path)
+            b64 = _file_to_base64_image(cover_path, max_edge=COVER_MAX_EDGE, quality=60)
             self._cover_cache[album_id] = b64
             return b64
 
         has_cover = await self._download_cover(album_id, cover_path)
         if has_cover and os.path.exists(cover_path) and os.path.getsize(cover_path) > 0:
-            b64 = _file_to_base64_image(cover_path)
+            b64 = _file_to_base64_image(cover_path, max_edge=COVER_MAX_EDGE, quality=60)
             self._cover_cache[album_id] = b64
             return b64
         return None
 
     def _search_page_sync(self, page_num: int, keyword: str) -> list:
-        """同步搜索单页（在线程池中运行）"""
         try:
             page: JmSearchPage = self._client.search(
                 search_query=keyword,
@@ -231,10 +252,9 @@ class JMComicPlugin(Star):
             logger.error(f"第{page_num}页搜索失败: {e}")
             if page_num == 1:
                 raise
-            return []  # 后续页失败不中断
+            return []
 
     async def _jm_search(self, keyword: str) -> list:
-        """并行搜索最多 MAX_PAGES 页，返回最多 MAX_RESULTS 个结果"""
         if not self._client:
             return []
         try:
@@ -248,7 +268,7 @@ class JMComicPlugin(Star):
             all_results = []
             for p in pages:
                 if isinstance(p, Exception):
-                    if all_results:  # 第1页挂了且已有数据可继续
+                    if all_results:
                         break
                     logger.error(f"搜索异常: {p}")
                     return []
@@ -322,7 +342,7 @@ class JMComicPlugin(Star):
                 name="JMComic",
                 content=[Plain(
                     f"「{cache['keyword']}」第{page + 1}/{total_pages}页\n"
-                    f"回复数字看详情  +下一页  -上一页  /jm看图 <序号>"
+                    f"/jm <序号>看详情  +下一页  -上一页  /jm看图 <序号>"
                 )],
             ))
 
@@ -352,10 +372,21 @@ class JMComicPlugin(Star):
 
         event.stop_event()
 
-        # 纯数字直接查看详情（本子ID）
+        # 纯数字：判断是否有有效搜索缓存
         if keyword.isdigit():
-            async for result in self._jm_show_detail(event, keyword):
-                yield result
+            if self._cache_valid(event.get_sender_id()):
+                # 有缓存 → 全局序号查详情
+                cache = self._search_cache[event.get_sender_id()]
+                n = int(keyword)
+                if 1 <= n <= len(cache["results"]):
+                    async for result in self._jm_show_detail(event, cache["results"][n - 1]["album_id"]):
+                        yield result
+                else:
+                    yield event.plain_result(f"序号超出范围（共 {len(cache['results'])} 个结果）。")
+            else:
+                # 无缓存 → 禁漫ID直接查
+                async for result in self._jm_show_detail(event, keyword):
+                    yield result
             return
 
         results = await self._jm_search(keyword)
@@ -368,6 +399,7 @@ class JMComicPlugin(Star):
         self._search_cache[user_id] = {
             "results": results, "page": 0,
             "total_pages": total_pages, "keyword": keyword,
+            "expires_at": time.time() + CACHE_TTL,
         }
         self._cover_cache.clear()
 
@@ -376,7 +408,7 @@ class JMComicPlugin(Star):
             yield result
 
     async def _jm_show_detail(self, event, album_id: str):
-        """显示本子详情（封面base64+文本，Nodes合并转发）。album_id 可以是真实ID或纯数字搜索词。"""
+        """显示本子详情（封面base64+文本，Nodes合并转发）。"""
         album = await self._jm_get_detail(album_id)
         if not album:
             yield event.plain_result(f"未找到本子 JM{album_id}")
@@ -391,7 +423,7 @@ class JMComicPlugin(Star):
 
         node_content = []
         if has_cover and os.path.exists(cover_path) and os.path.getsize(cover_path) > 0:
-            node_content.append(Image(file=_file_to_base64_image(cover_path)))
+            node_content.append(Image(file=_file_to_base64_image(cover_path, max_edge=COVER_MAX_EDGE, quality=60)))
         node_content.append(Plain(text))
 
         nodes = Nodes([])
@@ -428,9 +460,9 @@ class JMComicPlugin(Star):
         photo_id = None
         chapter_name = ""
 
-        # 优先：从搜索结果取全局第N本 → 自动查详情 → 下载第1话
-        cache = self._search_cache.get(user_id)
-        if cache:
+        # 优先：有缓存 → 全局第N本 → 下载第1话
+        if self._cache_valid(user_id):
+            cache = self._search_cache[user_id]
             if 1 <= n <= len(cache["results"]):
                 album_info = cache["results"][n - 1]
                 album_id = album_info["album_id"]
@@ -445,14 +477,13 @@ class JMComicPlugin(Star):
                 yield event.plain_result(f"序号超出范围（共 {len(cache['results'])} 个结果）。")
                 return
 
-        # 无搜索缓存时的备用逻辑
-        if not cache:
-            if not photo_id:
-                album: JmAlbumDetail | None = self._photo_cache.get(user_id)
-                if album and 1 <= n <= len(album.episode_list):
-                    ep = album.episode_list[n - 1]
-                    photo_id = ep[0]
-                    chapter_name = f"第{ep[1]}话 {ep[2]}"
+        # 无缓存时的备用逻辑
+        if not photo_id:
+            album: JmAlbumDetail | None = self._photo_cache.get(user_id)
+            if album and 1 <= n <= len(album.episode_list):
+                ep = album.episode_list[n - 1]
+                photo_id = ep[0]
+                chapter_name = f"第{ep[1]}话 {ep[2]}"
             if not photo_id:
                 photo_id = keyword
                 chapter_name = f"JM{photo_id}"
@@ -496,7 +527,6 @@ class JMComicPlugin(Star):
                 yield event.plain_result(f"章节 {chapter_name} 下载完成但未找到图片文件。")
                 return
 
-            # 压缩图片 → PDF
             compressed_dir = os.path.join(dl_dir, "compressed")
             saved_files = self._compress_images(saved_files, compressed_dir, quality=75, max_edge=1600)
 
