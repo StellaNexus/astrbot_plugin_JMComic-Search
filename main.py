@@ -579,7 +579,7 @@ class JMComicPlugin(Star):
 
     @filter.llm_tool(name="get_JMComic_detail")
     async def agent_detail(self, event, album_id: str):
-        """获取禁漫本子详情，返回本子名、作者、标签、章节列表。
+        """获取禁漫本子详情，以合并转发形式返回封面+本子名+作者+标签+章节列表。
 
         Args:
             album_id(string): 禁漫本子ID，如 1446388
@@ -592,7 +592,26 @@ class JMComicPlugin(Star):
             yield event.plain_result(f"未找到本子 JM{album_id}")
             return
         text = self._build_detail_text(album)
-        yield event.plain_result(text)
+
+        cover_path = os.path.join(self.temp_dir, f"cover_{album_id}.jpg")
+        has_cover = await self._download_cover(album_id, cover_path)
+
+        node_content = []
+        if has_cover and os.path.exists(cover_path) and os.path.getsize(cover_path) > 0:
+            node_content.append(Image(file=_file_to_base64_image(cover_path, max_edge=COVER_MAX_EDGE, quality=60)))
+        node_content.append(Plain(text))
+
+        nodes = Nodes([])
+        nodes.nodes.append(Node(uin=event.get_self_id(), name="JMComic", content=node_content))
+
+        try:
+            yield event.chain_result([nodes])
+        finally:
+            if has_cover and os.path.exists(cover_path):
+                try:
+                    os.remove(cover_path)
+                except Exception:
+                    pass
 
     @filter.llm_tool(name="download_JMComic_chapter")
     async def agent_download(self, event, photo_id: str):
