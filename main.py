@@ -556,6 +556,101 @@ class JMComicPlugin(Star):
             if pdf_path and os.path.exists(pdf_path):
                 asyncio.create_task(self._delayed_cleanup(pdf_path))
 
+    # ============ Agent 工具（LLM 可调用）============
+
+    @filter.llm_tool(name="search_JMComic")
+    async def agent_search(self, event, keyword: str):
+        """搜索禁漫本子，返回按最新更新排序的前10个结果。参数 keyword 为搜索关键词。"""
+        if not HAS_JMCOMIC or not self._client:
+            yield event.plain_result("JMComic 服务不可用。")
+            return
+        results = await self._jm_search(keyword)
+        if not results:
+            yield event.plain_result(f"未找到与「{keyword}」相关的本子。")
+            return
+        lines = [f"搜索「{keyword}」，找到 {len(results)} 个结果："]
+        for i, r in enumerate(results[:10]):
+            lines.append(f"{i + 1}. [{r['album_id']}] {r['name']}")
+        yield event.plain_result("\n".join(lines))
+
+    @filter.llm_tool(name="get_JMComic_detail")
+    async def agent_detail(self, event, album_id: str):
+        """获取禁漫本子详情，返回本子名、作者、标签、章节列表。参数 album_id 为禁漫本子ID（如 1446388）。"""
+        if not HAS_JMCOMIC or not self._client:
+            yield event.plain_result("JMComic 服务不可用。")
+            return
+        album = await self._jm_get_detail(album_id)
+        if not album:
+            yield event.plain_result(f"未找到本子 JM{album_id}")
+            return
+        text = self._build_detail_text(album)
+        yield event.plain_result(text)
+
+    @filter.llm_tool(name="download_JMComic_chapter")
+    async def agent_download(self, event, photo_id: str):
+        """下载禁漫指定章节的所有图片并拼接为 PDF 文件发送。参数 photo_id 为章节ID（在详情中的章节列表可找到）。"""
+        if not HAS_JMCOMIC or not self._client:
+            yield event.plain_result("JMComic 服务不可用。")
+            return
+
+        dl_dir = os.path.join(self.temp_dir, f"photo_{photo_id}_{uuid.uuid4().hex[:8]}")
+        os.makedirs(dl_dir, exist_ok=True)
+        pdf_path = None
+
+        try:
+            loop = asyncio.get_event_loop()
+
+            def do_download():
+                try:
+                    temp_opt = self._option.copy_option()
+                    temp_opt.dir_rule.base_dir = dl_dir
+                    temp_opt.dir_rule.rule_dsl = "Bd"
+                    temp_opt.download.threading.image = 30
+                    jmcomic.download_photo(photo_id, temp_opt, check_exception=False)
+                    return True
+                except Exception as e:
+                    logger.error(f"下载章节失败: {e}")
+                    return False
+
+            success = await loop.run_in_executor(None, do_download)
+            if not success:
+                yield event.plain_result(f"章节 JM{photo_id} 下载失败。")
+                return
+
+            exts = ("*.jpg", "*.jpeg", "*.png", "*.webp", "*.gif", "*.bmp")
+            saved_files = []
+            for ext in exts:
+                saved_files.extend(glob.glob(os.path.join(dl_dir, "**", ext), recursive=True))
+            saved_files = sorted(saved_files)
+
+            total = len(saved_files)
+            if total == 0:
+                yield event.plain_result(f"章节 JM{photo_id} 下载完成但未找到图片文件。")
+                return
+
+            compressed_dir = os.path.join(dl_dir, "compressed")
+            saved_files = self._compress_images(saved_files, compressed_dir)
+
+            safe_name = f"agent_{uuid.uuid4().hex[:8]}.pdf"
+            pdf_path = os.path.join(self.temp_dir, safe_name)
+            if not self._images_to_pdf(saved_files, pdf_path):
+                yield event.plain_result("PDF 生成失败。")
+                return
+
+            yield event.plain_result(f"共 {total} 张，JM{photo_id}.pdf")
+            yield event.chain_result([File(file=pdf_path, name=f"JM{photo_id}.pdf")])
+
+        except Exception as e:
+            logger.error(f"Agent 下载异常: {e}")
+            yield event.plain_result(f"下载失败: {e}")
+        finally:
+            try:
+                shutil.rmtree(dl_dir, ignore_errors=True)
+            except Exception:
+                pass
+            if pdf_path and os.path.exists(pdf_path):
+                asyncio.create_task(self._delayed_cleanup(pdf_path))
+
     @staticmethod
     async def _delayed_cleanup(filepath: str, delay: float = 3.0):
         await asyncio.sleep(delay)
