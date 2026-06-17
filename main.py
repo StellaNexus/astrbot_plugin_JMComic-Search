@@ -560,7 +560,11 @@ class JMComicPlugin(Star):
 
     @filter.llm_tool(name="search_JMComic")
     async def agent_search(self, event, keyword: str):
-        """搜索禁漫本子，返回按最新更新排序的前10个结果。参数 keyword 为搜索关键词。"""
+        """搜索禁漫本子，返回按最新更新排序的前10个结果。
+
+        Args:
+            keyword(string): 搜索关键词，如 少女、全彩 等
+        """
         if not HAS_JMCOMIC or not self._client:
             yield event.plain_result("JMComic 服务不可用。")
             return
@@ -575,7 +579,11 @@ class JMComicPlugin(Star):
 
     @filter.llm_tool(name="get_JMComic_detail")
     async def agent_detail(self, event, album_id: str):
-        """获取禁漫本子详情，返回本子名、作者、标签、章节列表。参数 album_id 为禁漫本子ID（如 1446388）。"""
+        """获取禁漫本子详情，返回本子名、作者、标签、章节列表。
+
+        Args:
+            album_id(string): 禁漫本子ID，如 1446388
+        """
         if not HAS_JMCOMIC or not self._client:
             yield event.plain_result("JMComic 服务不可用。")
             return
@@ -588,7 +596,11 @@ class JMComicPlugin(Star):
 
     @filter.llm_tool(name="download_JMComic_chapter")
     async def agent_download(self, event, photo_id: str):
-        """下载禁漫指定章节的所有图片并拼接为 PDF 文件发送。参数 photo_id 为章节ID（在详情中的章节列表可找到）。"""
+        """下载禁漫指定章节的所有图片并拼接为 PDF 文件发送。
+
+        Args:
+            photo_id(string): 章节ID，从详情中的章节列表获取，如 1446388
+        """
         if not HAS_JMCOMIC or not self._client:
             yield event.plain_result("JMComic 服务不可用。")
             return
