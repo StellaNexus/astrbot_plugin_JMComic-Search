@@ -38,6 +38,7 @@ MAX_PAGES = 3
 MAX_RESULTS = PAGE_SIZE * MAX_PAGES  # 24
 CACHE_TTL = 300  # 搜索缓存 5 分钟
 COVER_MAX_EDGE = 400  # 封面长边限制（减少 base64 体积，避免 retcode=1200）
+COVER_B64_MAX = 40960  # 40KB，超此大小的 base64 二次压缩
 
 _thread_pool = ThreadPoolExecutor(max_workers=3)
 
@@ -219,21 +220,25 @@ class JMComicPlugin(Star):
             return False
 
     async def _get_cover_base64(self, album_id: str) -> str | None:
-        """获取封面 base64（压缩后，减少体积避免 retcode=1200）"""
+        """获取封面 base64（压缩后，>40KB 自动二次压缩，避免 retcode=1200）"""
         if album_id in self._cover_cache:
             return self._cover_cache[album_id]
 
-        cover_path = os.path.join(self.temp_dir, f"cover_{album_id}.jpg")
-        if os.path.exists(cover_path) and os.path.getsize(cover_path) > 0:
-            b64 = _file_to_base64_image(cover_path, max_edge=COVER_MAX_EDGE, quality=60)
+        def _load_and_cache(path: str) -> str | None:
+            b64 = _file_to_base64_image(path, max_edge=COVER_MAX_EDGE, quality=60)
+            # >40KB 二次压缩：200px / q40
+            if len(b64) > COVER_B64_MAX:
+                b64 = _file_to_base64_image(path, max_edge=200, quality=40)
             self._cover_cache[album_id] = b64
             return b64
 
+        cover_path = os.path.join(self.temp_dir, f"cover_{album_id}.jpg")
+        if os.path.exists(cover_path) and os.path.getsize(cover_path) > 0:
+            return _load_and_cache(cover_path)
+
         has_cover = await self._download_cover(album_id, cover_path)
         if has_cover and os.path.exists(cover_path) and os.path.getsize(cover_path) > 0:
-            b64 = _file_to_base64_image(cover_path, max_edge=COVER_MAX_EDGE, quality=60)
-            self._cover_cache[album_id] = b64
-            return b64
+            return _load_and_cache(cover_path)
         return None
 
     def _search_page_sync(self, page_num: int, keyword: str) -> list:
@@ -560,7 +565,7 @@ class JMComicPlugin(Star):
 
     @filter.llm_tool(name="search_JMComic")
     async def agent_search(self, event, keyword: str):
-        """搜索禁漫本子，返回按最新更新排序的前10个结果。
+        """搜索禁漫本子，返回最新更新的前10个结果（合并转发封面+名字），结果写入搜索缓存供后续命令/agent共用。
 
         Args:
             keyword(string): 搜索关键词，如 少女、全彩 等
@@ -572,10 +577,38 @@ class JMComicPlugin(Star):
         if not results:
             yield event.plain_result(f"未找到与「{keyword}」相关的本子。")
             return
-        lines = [f"搜索「{keyword}」，找到 {len(results)} 个结果："]
-        for i, r in enumerate(results[:10]):
-            lines.append(f"{i + 1}. [{r['album_id']}] {r['name']}")
-        yield event.plain_result("\n".join(lines))
+
+        # 写入缓存，agent 和命令模式共享
+        user_id = event.get_sender_id()
+        self._search_cache[user_id] = {
+            "results": results, "page": 0,
+            "total_pages": (len(results) + PAGE_SIZE - 1) // PAGE_SIZE,
+            "keyword": keyword,
+            "expires_at": time.time() + CACHE_TTL,
+        }
+        self._cover_cache.clear()
+
+        # 取前 10 条发合并转发
+        top = results[:10]
+        node_list = []
+        for i, r in enumerate(top):
+            album_id = r["album_id"]
+            name = r.get("name", "未知")
+            cover_b64 = await self._get_cover_base64(album_id)
+            content = []
+            if cover_b64:
+                content.append(Image(file=cover_b64))
+            content.append(Plain(f"{i + 1}. [{album_id}] {name}"))
+            node_list.append(Node(uin=event.get_self_id(), name="JMComic", content=content))
+
+        node_list.append(Node(
+            uin=event.get_self_id(),
+            name="JMComic",
+            content=[Plain(f"搜索「{keyword}」，找到 {len(results)} 个结果，显示前10个。")],
+        ))
+
+        nodes = Nodes(node_list)
+        yield event.chain_result([nodes])
 
     @filter.llm_tool(name="get_JMComic_detail")
     async def agent_detail(self, event, album_id: str):
